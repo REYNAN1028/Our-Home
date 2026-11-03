@@ -1,0 +1,143 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function me() {
+      return request.auth.uid;
+    }
+
+    function couplePath(coupleId) {
+      return /databases/$(database)/documents/couples/$(coupleId);
+    }
+
+    // True when the signed-in user is one of the two members of the couple.
+    // Always checks the couple document itself, never the (user-editable) user doc.
+    function isMember(coupleId) {
+      return signedIn() && me() in get(couplePath(coupleId)).data.members;
+    }
+
+    // ---------------------------------------------------------------- users
+    match /users/{userId} {
+      allow create: if signedIn() && me() == userId;
+      allow update: if signedIn() && me() == userId;
+      // You can read your own profile, and your partner's profile.
+      allow read: if signedIn() && (
+        me() == userId ||
+        (resource.data.get('coupleId', null) != null && isMember(resource.data.coupleId))
+      );
+    }
+
+    // -------------------------------------------------------------- invites
+    // Invite code -> coupleId. Readable by `get` only (codes cannot be listed).
+    match /invites/{code} {
+      allow get: if signedIn();
+      allow list: if false;
+      allow create: if signedIn() && request.resource.data.createdBy == me();
+    }
+
+    // -------------------------------------------------------------- couples
+    match /couples/{coupleId} {
+      allow read: if signedIn() && me() in resource.data.members;
+
+      allow create: if signedIn()
+        && request.resource.data.members == [me()]
+        && request.resource.data.createdBy == me();
+
+      allow update: if signedIn() && (
+        // A member editing shared fields (streak, start date...). Members can't change.
+        (me() in resource.data.members
+          && request.resource.data.members == resource.data.members)
+        ||
+        // The partner joining a couple that still has a free seat.
+        (resource.data.members.size() == 1
+          && !(me() in resource.data.members)
+          && request.resource.data.members == resource.data.members.concat([me()])
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['members']))
+      );
+
+      // ----------------------------------------------------------- letters
+      match /letters/{letterId} {
+        allow read: if isMember(coupleId);
+
+        allow create: if isMember(coupleId)
+          && request.resource.data.fromUid == me()
+          && request.resource.data.toUid != me()
+          && request.resource.data.toUid in get(couplePath(coupleId)).data.members;
+
+        // The recipient can only mark a letter as read.
+        allow update: if isMember(coupleId)
+          && resource.data.toUid == me()
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['readAt', 'preview']);
+
+        // The sender can take back a letter that has not been delivered yet.
+        allow delete: if isMember(coupleId)
+          && resource.data.fromUid == me()
+          && resource.data.openAt > request.time;
+
+        // The letter text and photos live in a separate document so a sealed
+        // letter's content cannot be read before its open date.
+        match /content/{docId} {
+          allow read: if isMember(coupleId) && (
+            get(/databases/$(database)/documents/couples/$(coupleId)/letters/$(letterId)).data.fromUid == me() ||
+            get(/databases/$(database)/documents/couples/$(coupleId)/letters/$(letterId)).data.openAt <= request.time
+          );
+          allow create: if isMember(coupleId)
+            && getAfter(/databases/$(database)/documents/couples/$(coupleId)/letters/$(letterId)).data.fromUid == me();
+          allow delete: if isMember(coupleId)
+            && get(/databases/$(database)/documents/couples/$(coupleId)/letters/$(letterId)).data.fromUid == me();
+        }
+      }
+
+      // ---------------------------------------------------------- memories
+      match /memories/{memoryId} {
+        allow read: if isMember(coupleId);
+        allow create: if isMember(coupleId) && request.resource.data.addedBy == me();
+        allow update: if isMember(coupleId);
+        allow delete: if isMember(coupleId) && resource.data.addedBy == me();
+      }
+
+      // ------------------------------------------------- to-dos and goals
+      match /todos/{todoId} {
+        allow read, create, update, delete: if isMember(coupleId);
+      }
+      match /goals/{goalId} {
+        allow read, create, update, delete: if isMember(coupleId);
+      }
+
+      // --------------------------------------------------- daily question
+      // `answered` is a public marker (who answered), `answers` holds the text.
+      // You can only read your partner's text after you have answered yourself.
+      match /answered/{answerId} {
+        allow read: if isMember(coupleId);
+        allow create: if isMember(coupleId)
+          && request.resource.data.uid == me()
+          && answerId == request.resource.data.dateKey + '_' + me();
+      }
+      match /answers/{answerId} {
+        allow read: if isMember(coupleId) && (
+          resource.data.uid == me() ||
+          exists(/databases/$(database)/documents/couples/$(coupleId)/answers/$(resource.data.dateKey + '_' + me()))
+        );
+        allow create: if isMember(coupleId)
+          && request.resource.data.uid == me()
+          && answerId == request.resource.data.dateKey + '_' + me();
+      }
+
+      // -------------------------------------------------------------- chat
+      match /messages/{messageId} {
+        allow read: if isMember(coupleId);
+        allow create: if isMember(coupleId) && request.resource.data.fromUid == me();
+        // The receiver can only set delivery / read receipts.
+        allow update: if isMember(coupleId)
+          && resource.data.fromUid != me()
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['deliveredAt', 'readAt']);
+        allow delete: if isMember(coupleId) && resource.data.fromUid == me();
+      }
+    }
+  }
+}
